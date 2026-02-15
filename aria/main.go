@@ -78,11 +78,57 @@ You're here to:
 
 Remember: You're not just here to agree. Your job is to make ideas better through constructive challenge and creative alternatives.`
 
+// getAuthConfig returns (token, isOAuth) by checking env vars and OpenClaw auth profiles
+func getAuthConfig() (string, bool) {
+	// 1. Check ANTHROPIC_API_KEY
+	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
+		return key, false
+	}
+	// 2. Check ANTHROPIC_OAUTH_KEY
+	if key := os.Getenv("ANTHROPIC_OAUTH_KEY"); key != "" {
+		return key, true
+	}
+	// 3. Try reading from OpenClaw auth profiles
+	home, _ := os.UserHomeDir()
+	authPath := home + "/.openclaw/agents/main/agent/auth-profiles.json"
+	data, err := os.ReadFile(authPath)
+	if err == nil {
+		var profiles map[string]json.RawMessage
+		if json.Unmarshal(data, &profiles) == nil {
+			if profilesSection, ok := profiles["profiles"]; ok {
+				var ps map[string]json.RawMessage
+				if json.Unmarshal(profilesSection, &ps) == nil {
+					if anthropic, ok := ps["anthropic:default"]; ok {
+						var entry struct {
+							Token string `json:"token"`
+							Type  string `json:"type"`
+						}
+						if json.Unmarshal(anthropic, &entry) == nil && entry.Token != "" {
+							// sk-ant-oat prefix = OAuth token
+							isOAuth := entry.Type == "oauth" || entry.Type == "bearer" || len(entry.Token) > 10 && entry.Token[:10] == "sk-ant-oat"
+							return entry.Token, isOAuth
+						}
+					}
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+var authToken string
+var authIsOAuth bool
+
 func main() {
-	// Check for API key
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		log.Fatal("ANTHROPIC_API_KEY environment variable is required")
+	// Check for API key from multiple sources
+	authToken, authIsOAuth = getAuthConfig()
+	if authToken == "" {
+		log.Fatal("No Anthropic API key found. Set ANTHROPIC_API_KEY, ANTHROPIC_OAUTH_KEY, or configure OpenClaw auth.")
+	}
+	if authIsOAuth {
+		log.Println("Using OAuth/Bearer authentication")
+	} else {
+		log.Println("Using API key authentication")
 	}
 
 	// Initialize Gin router
@@ -183,15 +229,13 @@ func handleChat(c *gin.Context) {
 }
 
 func callClaudeAPI(userMessage string) (string, error) {
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	
 	// Prepare messages for API call
 	messages := make([]Message, len(conversationHistory))
 	copy(messages, conversationHistory)
 
 	// Construct request
 	request := AnthropicRequest{
-		Model:       "claude-3-sonnet-20240229",
+		Model:       "claude-sonnet-4-20250514",
 		Messages:    messages,
 		MaxTokens:   1000,
 		Temperature: 0.7,
@@ -213,7 +257,12 @@ func callClaudeAPI(userMessage string) (string, error) {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
+	if authIsOAuth {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+		req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	} else {
+		req.Header.Set("x-api-key", authToken)
+	}
 	req.Header.Set("anthropic-version", "2023-06-01")
 
 	client := &http.Client{}
